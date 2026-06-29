@@ -326,6 +326,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     proxies = context.user_data.get('proxies', [])
     proxy_status = f"🔌 *Proxies: {len(proxies)} loaded*" if proxies else "🔌 *No proxies*"
+    speed = context.user_data.get('concurrency', 10)
     
     welcome_text = (
         "✨ *Welcome to CC Checker Bot!* ✨\n\n"
@@ -333,7 +334,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 *Send me cards in this format:*\n"
         "`5121078835045021|12|2041|111`\n\n"
         "📂 *Or send a .txt file with multiple cards*\n"
-        "⚡ *Use /chk to start checking*\n\n"
+        "⚡ *Use /chk to start checking*\n"
+        f"⚡ *Current Speed: {speed} concurrent*\n\n"
         f"{proxy_status}\n\n"
         "🛠 *Choose an option below:*"
     )
@@ -747,7 +749,7 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, cards):
-    """Process multiple cards with progress bar"""
+    """Process multiple cards with progress bar - FAST VERSION"""
     global processing_cards, processing_status, current_message_id, current_chat_id
     
     processing_cards = cards
@@ -766,7 +768,8 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
         f"❌ *Declined:* `0`\n"
         f"⚠️ *Unknown:* `0`\n"
         f"🚫 *Errors:* `0`\n"
-        f"🔌 *Proxies:* `{len(proxies)}` loaded\n\n"
+        f"🔌 *Proxies:* `{len(proxies)}` loaded\n"
+        f"⚡ *Concurrency:* `{context.user_data.get('concurrency', 10)}`\n\n"
         "⏳ *Processing...*"
     )
     
@@ -776,15 +779,26 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
     )
     current_message_id = msg.message_id
     
-    # Process cards
-    async with aiohttp.ClientSession() as session:
-        for i, card in enumerate(cards, 1):
-            # Randomly select a proxy if available
+    # 결과 저장용
+    results = {}
+    completed = 0
+    total = len(cards)
+    
+    # 세마포어로 동시 처리 제어
+    concurrency = context.user_data.get('concurrency', 10)
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    async def process_single_card(card, index):
+        nonlocal completed
+        async with semaphore:
+            # 프록시 랜덤 선택
             proxy = random.choice(proxies) if proxies else None
             result = await check_cc(card, proxy_url=proxy)
-            processing_status[card] = result
             
-            # Update stats
+            # 결과 저장
+            results[card] = result
+            
+            # 통계 업데이트
             stats['total'] += 1
             if 'APPROVED' in result:
                 stats['approved'] += 1
@@ -795,38 +809,97 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
             else:
                 stats['unknown'] += 1
             
-            # Update progress bar
-            progress = int((i / len(cards)) * 10)
-            bar = "▰" * progress + "▱" * (10 - progress)
-            percentage = int((i / len(cards)) * 100)
+            completed += 1
             
-            progress_text = (
-                f"🔄 *Processing Cards*\n\n"
-                f"{bar} {percentage}%\n\n"
-                f"📊 *Total:* `{len(cards)}`\n"
-                f"✅ *Approved:* `{stats['approved']}`\n"
-                f"❌ *Declined:* `{stats['declined']}`\n"
-                f"⚠️ *Unknown:* `{stats['unknown']}`\n"
-                f"🚫 *Errors:* `{stats['errors']}`\n"
-                f"🔌 *Proxies:* `{len(proxies)}` loaded\n\n"
-                f"⏳ *Processing...* `{i}/{len(cards)}`"
+            # 진행률 업데이트 (10개마다 또는 마지막에)
+            if completed % 5 == 0 or completed == total:
+                await update_progress(completed, total, stats, len(proxies), concurrency)
+            
+            return result
+    
+    async def update_progress(completed, total, stats, proxy_count, concurrency):
+        progress = int((completed / total) * 10)
+        bar = "▰" * progress + "▱" * (10 - progress)
+        percentage = int((completed / total) * 100)
+        
+        progress_text = (
+            f"🔄 *Processing Cards*\n\n"
+            f"{bar} {percentage}%\n\n"
+            f"📊 *Total:* `{total}`\n"
+            f"✅ *Approved:* `{stats['approved']}`\n"
+            f"❌ *Declined:* `{stats['declined']}`\n"
+            f"⚠️ *Unknown:* `{stats['unknown']}`\n"
+            f"🚫 *Errors:* `{stats['errors']}`\n"
+            f"🔌 *Proxies:* `{proxy_count}` loaded\n"
+            f"⚡ *Concurrency:* `{concurrency}`\n\n"
+            f"⏳ *Processing...* `{completed}/{total}`"
+        )
+        
+        try:
+            await context.bot.edit_message_text(
+                progress_text,
+                chat_id=current_chat_id,
+                message_id=current_message_id,
+                parse_mode='Markdown'
             )
-            
-            try:
-                await context.bot.edit_message_text(
-                    progress_text,
-                    chat_id=current_chat_id,
-                    message_id=current_message_id,
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Error updating progress: {e}")
-            
-            # Small delay to avoid rate limiting
-            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Error updating progress: {e}")
+    
+    # 모든 카드 동시 처리
+    tasks = []
+    for i, card in enumerate(cards):
+        task = asyncio.create_task(process_single_card(card, i))
+        tasks.append(task)
+    
+    # 모든 태스크 완료 대기
+    await asyncio.gather(*tasks)
+    
+    # 결과 저장
+    processing_status = results
     
     # Show results
     await show_results(update, context)
+
+async def set_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set concurrency (speed)"""
+    try:
+        args = context.args
+        if not args:
+            current = context.user_data.get('concurrency', 10)
+            await update.message.reply_text(
+                f"⚡ *Current Speed:* `{current}` concurrent requests\n\n"
+                f"📌 *Usage:* `/speed <number>`\n"
+                f"*Example:* `/speed 20`\n\n"
+                f"⚠️ *Recommended:* `5-20`\n"
+                f"*Too high may cause errors!*",
+                parse_mode='Markdown'
+            )
+            return
+        
+        speed = int(args[0])
+        if speed < 1:
+            await update.message.reply_text("❌ *Speed must be at least 1!*", parse_mode='Markdown')
+            return
+        if speed > 50:
+            await update.message.reply_text(
+                "⚠️ *Speed too high! Maximum is 50.*\n"
+                "Setting to 50.",
+                parse_mode='Markdown'
+            )
+            speed = 50
+        
+        context.user_data['concurrency'] = speed
+        await update.message.reply_text(
+            f"✅ *Speed set to `{speed}` concurrent requests!*\n\n"
+            f"⚡ Cards will be checked {speed} at a time.",
+            parse_mode='Markdown'
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ *Invalid number!*\n"
+            "Usage: `/speed <number>`",
+            parse_mode='Markdown'
+        )
 
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show final results with inline buttons"""
@@ -934,7 +1007,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    # Create the Application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add command handlers
@@ -944,6 +1016,7 @@ def main():
     application.add_handler(CommandHandler("reset", reset_stats))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("help", show_help))
+    application.add_handler(CommandHandler("speed", set_speed))  # 🔥 NEW
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -957,7 +1030,6 @@ def main():
     # Add error handler
     application.add_error_handler(error_handler)
     
-    # Start the bot
     print("🤖 Bot started! Press Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
