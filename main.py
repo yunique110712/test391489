@@ -394,6 +394,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "clear_proxies":
         await clear_proxies_handler(update, context)
+    
+    # 🛑 STOP 버튼 처리
+    elif query.data == "stop_processing":
+        context.user_data['stop_processing'] = True
+        await query.edit_message_text(
+            "🛑 *Stopping...*\n\n"
+            "Please wait for current cards to finish...",
+            parse_mode='Markdown'
+        )
 
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show statistics"""
@@ -749,7 +758,7 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, cards):
-    """Process multiple cards with progress bar - FAST VERSION"""
+    """Process multiple cards with progress bar + STOP button"""
     global processing_cards, processing_status, current_message_id, current_chat_id
     
     processing_cards = cards
@@ -759,7 +768,13 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
     # Load proxies from context
     proxies = context.user_data.get('proxies', [])
     
-    # Send initial progress message
+    # 중단 플래그 초기화
+    context.user_data['stop_processing'] = False
+    
+    # Send initial progress message with STOP button
+    keyboard = [[InlineKeyboardButton("🛑 STOP", callback_data="stop_processing")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     progress_text = (
         "🔄 *Processing Cards*\n\n"
         "▱▱▱▱▱▱▱▱▱▱ 0%\n\n"
@@ -768,34 +783,35 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
         f"❌ *Declined:* `0`\n"
         f"⚠️ *Unknown:* `0`\n"
         f"🚫 *Errors:* `0`\n"
-        f"🔌 *Proxies:* `{len(proxies)}` loaded\n"
-        f"⚡ *Concurrency:* `{context.user_data.get('concurrency', 10)}`\n\n"
+        f"🔌 *Proxies:* `{len(proxies)}` loaded\n\n"
         "⏳ *Processing...*"
     )
     
     msg = await update.message.reply_text(
         progress_text,
-        parse_mode='Markdown'
+        parse_mode='Markdown',
+        reply_markup=reply_markup
     )
     current_message_id = msg.message_id
     
-    # 결과 저장용
+    # 동시 처리 수 (기본 10, 더 빠르게)
+    concurrency = context.user_data.get('concurrency', 15)
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    # 결과 저장
     results = {}
     completed = 0
     total = len(cards)
     
-    # 세마포어로 동시 처리 제어
-    concurrency = context.user_data.get('concurrency', 10)
-    semaphore = asyncio.Semaphore(concurrency)
-    
-    async def process_single_card(card, index):
+    async def process_one(card):
         nonlocal completed
         async with semaphore:
-            # 프록시 랜덤 선택
+            # 중단 체크
+            if context.user_data.get('stop_processing', False):
+                return None
+            
             proxy = random.choice(proxies) if proxies else None
             result = await check_cc(card, proxy_url=proxy)
-            
-            # 결과 저장
             results[card] = result
             
             # 통계 업데이트
@@ -811,13 +827,13 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
             
             completed += 1
             
-            # 진행률 업데이트 (10개마다 또는 마지막에)
+            # 5개마다 또는 마지막에 업데이트
             if completed % 5 == 0 or completed == total:
-                await update_progress(completed, total, stats, len(proxies), concurrency)
+                await update_progress(completed)
             
             return result
     
-    async def update_progress(completed, total, stats, proxy_count, concurrency):
+    async def update_progress(completed):
         progress = int((completed / total) * 10)
         bar = "▰" * progress + "▱" * (10 - progress)
         percentage = int((completed / total) * 100)
@@ -830,8 +846,8 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
             f"❌ *Declined:* `{stats['declined']}`\n"
             f"⚠️ *Unknown:* `{stats['unknown']}`\n"
             f"🚫 *Errors:* `{stats['errors']}`\n"
-            f"🔌 *Proxies:* `{proxy_count}` loaded\n"
-            f"⚡ *Concurrency:* `{concurrency}`\n\n"
+            f"🔌 *Proxies:* `{len(proxies)}` loaded\n"
+            f"⚡ *Speed:* `{concurrency}` concurrent\n\n"
             f"⏳ *Processing...* `{completed}/{total}`"
         )
         
@@ -840,24 +856,35 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
                 progress_text,
                 chat_id=current_chat_id,
                 message_id=current_message_id,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                reply_markup=reply_markup  # STOP 버튼 유지
             )
         except Exception as e:
             logger.error(f"Error updating progress: {e}")
     
-    # 모든 카드 동시 처리
-    tasks = []
-    for i, card in enumerate(cards):
-        task = asyncio.create_task(process_single_card(card, i))
-        tasks.append(task)
-    
-    # 모든 태스크 완료 대기
+    # 모든 카드 동시 실행
+    tasks = [asyncio.create_task(process_one(card)) for card in cards]
     await asyncio.gather(*tasks)
+    
+    # 중단되었는지 확인
+    if context.user_data.get('stop_processing', False):
+        await context.bot.edit_message_text(
+            f"🛑 *Processing STOPPED!*\n\n"
+            f"📊 *Checked:* `{completed}/{total}`\n"
+            f"✅ *Approved:* `{stats['approved']}`\n"
+            f"❌ *Declined:* `{stats['declined']}`\n"
+            f"⚠️ *Unknown:* `{stats['unknown']}`\n"
+            f"🚫 *Errors:* `{stats['errors']}`",
+            chat_id=current_chat_id,
+            message_id=current_message_id,
+            parse_mode='Markdown'
+        )
+        # 중단 플래그 초기화
+        context.user_data['stop_processing'] = False
+        return
     
     # 결과 저장
     processing_status = results
-    
-    # Show results
     await show_results(update, context)
 
 async def set_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
