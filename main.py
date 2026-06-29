@@ -395,13 +395,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "clear_proxies":
         await clear_proxies_handler(update, context)
     
-    # 🛑 STOP 버튼 처리 (수정됨)
+    # 🛑 STOP 버튼 - 즉시 중단
     elif query.data == "stop_processing":
         context.user_data['stop_processing'] = True
         await query.edit_message_text(
             "🛑 *Stopping...*\n\n"
-            "Waiting for current cards to finish...\n"
-            "⚠️ This may take a few seconds.",
+            "Current batch will finish, then stop.\n"
+            "⏳ Please wait a moment...",
             parse_mode='Markdown'
         )
 
@@ -759,7 +759,7 @@ async def start_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, cards):
-    """Process multiple cards with REAL-TIME progress (1개씩 업데이트)"""
+    """Process multiple cards with REAL-TIME progress + WORKING STOP button"""
     global processing_cards, processing_status, current_message_id, current_chat_id
     
     processing_cards = cards
@@ -795,9 +795,8 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
     )
     current_message_id = msg.message_id
     
-    # 동시 처리 수 (너무 빠르면 업데이트를 놓칠 수 있으므로 적절히)
+    # 동시 처리 수
     concurrency = context.user_data.get('concurrency', 10)
-    semaphore = asyncio.Semaphore(concurrency)
     
     # 결과 저장
     results = {}
@@ -805,16 +804,23 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
     total = len(cards)
     stopped = False
     
-    async def process_one(card):
+    async def process_one(card, index):
         nonlocal completed, stopped
-        async with semaphore:
-            # 중단 체크
-            if stopped or context.user_data.get('stop_processing', False):
+        
+        # 중단 체크 (태스크 시작 전)
+        if context.user_data.get('stop_processing', False) or stopped:
+            stopped = True
+            return None
+        
+        try:
+            proxy = random.choice(proxies) if proxies else None
+            result = await check_cc(card, proxy_url=proxy)
+            
+            # 중단 체크 (API 호출 후)
+            if context.user_data.get('stop_processing', False) or stopped:
                 stopped = True
                 return None
             
-            proxy = random.choice(proxies) if proxies else None
-            result = await check_cc(card, proxy_url=proxy)
             results[card] = result
             
             # 통계 업데이트
@@ -830,18 +836,30 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
             
             completed += 1
             
-            # 🎯 1개마다 업데이트 (실시간)
+            # 1개마다 업데이트
             await update_progress(completed)
             
             return result
+            
+        except asyncio.CancelledError:
+            # 태스크가 취소되면 여기로 옴
+            return None
+        except Exception as e:
+            # 에러 처리
+            results[card] = f"ERROR ⚠️ - {str(e)}"
+            stats['total'] += 1
+            stats['errors'] += 1
+            completed += 1
+            await update_progress(completed)
+            return None
     
     async def update_progress(completed):
         progress = int((completed / total) * 10) if total > 0 else 0
         bar = "▰" * progress + "▱" * (10 - progress)
         percentage = int((completed / total) * 100) if total > 0 else 0
         
-        # 중단되었는지 확인
-        is_stopped = stopped or context.user_data.get('stop_processing', False)
+        # 중단 확인
+        is_stopped = context.user_data.get('stop_processing', False) or stopped
         status_text = "🛑 *STOPPING...*" if is_stopped else "⏳ *Processing...*"
         
         progress_text = (
@@ -869,28 +887,43 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
                 reply_markup=markup
             )
         except Exception as e:
-            # 너무 자주 업데이트하면 에러 날 수 있음 (무시)
-            pass
+            pass  # 업데이트 실패는 무시
     
-    # 모든 카드 동시 실행
-    tasks = [asyncio.create_task(process_one(card)) for card in cards]
-    
-    # 완료될 때까지 대기
-    for task in asyncio.as_completed(tasks):
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        # 중단 신호가 오면 나머지 태스크 취소
-        if context.user_data.get('stop_processing', False):
+    # 🔥 중요: 태스크를 배치로 나눠서 실행 (중단 체크를 자주 하기 위함)
+    batch_size = concurrency
+    for i in range(0, total, batch_size):
+        # 중단되었으면 중지
+        if context.user_data.get('stop_processing', False) or stopped:
             stopped = True
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
             break
+        
+        batch = cards[i:i+batch_size]
+        tasks = []
+        
+        # 배치 태스크 생성
+        for j, card in enumerate(batch):
+            if context.user_data.get('stop_processing', False) or stopped:
+                stopped = True
+                break
+            task = asyncio.create_task(process_one(card, i+j))
+            tasks.append(task)
+        
+        # 배치 태스크 실행
+        for task in tasks:
+            if context.user_data.get('stop_processing', False) or stopped:
+                stopped = True
+                # 남은 태스크 취소
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                break
+            await task
+        
+        # 약간의 딜레이 (과부하 방지)
+        await asyncio.sleep(0.05)
     
-    # 중단되었는지 확인
-    if stopped or context.user_data.get('stop_processing', False):
+    # 중단 처리
+    if context.user_data.get('stop_processing', False) or stopped:
         await context.bot.edit_message_text(
             f"🛑 *Processing STOPPED!*\n\n"
             f"📊 *Checked:* `{completed}/{total}`\n"
@@ -898,7 +931,7 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
             f"❌ *Declined:* `{stats['declined']}`\n"
             f"⚠️ *Unknown:* `{stats['unknown']}`\n"
             f"🚫 *Errors:* `{stats['errors']}`\n\n"
-            f"⚡ *Remaining:* `{total - completed}` cards",
+            f"⏳ *Remaining:* `{total - completed}` cards",
             chat_id=current_chat_id,
             message_id=current_message_id,
             parse_mode='Markdown'
@@ -911,47 +944,6 @@ async def process_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, card
     # 결과 저장
     processing_status = results
     await show_results(update, context)
-
-async def set_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set concurrency (speed)"""
-    try:
-        args = context.args
-        if not args:
-            current = context.user_data.get('concurrency', 10)
-            await update.message.reply_text(
-                f"⚡ *Current Speed:* `{current}` concurrent requests\n\n"
-                f"📌 *Usage:* `/speed <number>`\n"
-                f"*Example:* `/speed 20`\n\n"
-                f"⚠️ *Recommended:* `5-20`\n"
-                f"*Too high may cause errors!*",
-                parse_mode='Markdown'
-            )
-            return
-        
-        speed = int(args[0])
-        if speed < 1:
-            await update.message.reply_text("❌ *Speed must be at least 1!*", parse_mode='Markdown')
-            return
-        if speed > 50:
-            await update.message.reply_text(
-                "⚠️ *Speed too high! Maximum is 50.*\n"
-                "Setting to 50.",
-                parse_mode='Markdown'
-            )
-            speed = 50
-        
-        context.user_data['concurrency'] = speed
-        await update.message.reply_text(
-            f"✅ *Speed set to `{speed}` concurrent requests!*\n\n"
-            f"⚡ Cards will be checked {speed} at a time.",
-            parse_mode='Markdown'
-        )
-    except ValueError:
-        await update.message.reply_text(
-            "❌ *Invalid number!*\n"
-            "Usage: `/speed <number>`",
-            parse_mode='Markdown'
-        )
 
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show final results with inline buttons"""
@@ -1067,8 +1059,7 @@ def main():
     application.add_handler(CommandHandler("stats", show_stats))
     application.add_handler(CommandHandler("reset", reset_stats))
     application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("help", show_help))
-    application.add_handler(CommandHandler("speed", set_speed))  # 🔥 NEW
+    application.add_handler(CommandHandler("help", show_help))  # 🔥 NEW
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(button_handler))
